@@ -1,0 +1,254 @@
+//ConfigItem.cs
+if(configurationParameters[9].Equals("#"))
+{
+    AcqusitionInterval = 1;
+}
+else
+{
+    Int32.TryParse(configurationParameters[9], out temp);
+    AcqusitionInterval = temp;
+}
+
+if(configurationParameters[10].Equals("#"))
+{
+    scalingFactor = 1;
+}
+else
+{
+    Int32.TryParse(configurationParameters[10], out temp);
+    scalingFactor = temp;
+}
+
+if(configurationParameters[11].Equals("#"))
+{
+    deviation = 0;
+}
+else
+{
+    Int32.TryParse(configurationParameters[11], out temp);
+    deviation = temp;
+}
+
+if (configurationParameters[12].Equals("#"))
+{
+    egu_max = 1;
+}
+else
+{
+    Int32.TryParse(configurationParameters[12], out temp);
+    egu_max = temp;
+}
+
+if (configurationParameters[13].Equals("#"))
+{
+    egu_min = 1;
+}
+else
+{
+    Int32.TryParse(configurationParameters[13], out temp);
+    egu_min = temp;
+}
+
+if (configurationParameters[14].Equals("#"))
+{
+    abnormalValue = 1;
+}
+else
+{
+    Int32.TryParse(configurationParameters[14], out temp);
+    abnormalValue = (ushort)temp;
+}
+
+if (configurationParameters[15].Equals("#"))
+{
+    highLimit = 1;
+}
+else
+{
+    Int32.TryParse(configurationParameters[15], out temp);
+    highLimit = temp;
+}
+
+if (configurationParameters[16].Equals("#"))
+{
+    lowLimit = 1;
+}
+else
+{
+    Int32.TryParse(configurationParameters[16], out temp);
+    lowLimit = temp;
+}
+
+//RtuCfg.txt
+STA 15
+TCP 25252
+
+HR_INT 1 1000 0 0 1000 400 AO @udaljenost 1   1 0 1000 0 # 600 20
+DO_REG 1 2000 0 0 1    0   DO @indikator  1   # # #    # 1 #   #
+DO_REG 2 3000 0 0 1    0   DO @openClose  1   # # #    # 1 #   #
+
+//AlarmProcessor.cs
+public AlarmType GetAlarmForAnalogPoint(double eguValue, IConfigItem configItem)
+{
+    if(eguValue > configItem.EGU_Max || eguValue < configItem.EGU_Min)
+        return AlarmType.REASONABILITY_FAILURE;
+    else if(eguValue > configItem.HighLimit)
+        return AlarmType.HIGH_ALARM;
+    else if(eguValue < configItem.LowLimit)
+        return AlarmType.LOW_ALARM;
+    else
+        return AlarmType.NO_ALARM;
+}
+
+public AlarmType GetAlarmForDigitalPoint(ushort state, IConfigItem configItem)
+{
+    if(configItem.AbnormalValue == state)
+        return AlarmType.ABNORMAL_VALUE;
+    else
+        return AlarmType.NO_ALARM;
+}
+
+//EGUConverter.cs
+public double ConvertToEGU(double scalingFactor, double deviation, ushort rawValue)
+{
+    return rawValue * scalingFactor + deviation;
+}
+
+public ushort ConvertToRaw(double scalingFactor, double deviation, double eguValue)
+{
+    return (ushort)((eguValue - deviation) / scalingFactor);
+}
+
+//ProcessingManager.cs
+public void ExecuteWriteCommand(IConfigItem configItem, ushort transactionId, byte remoteUnitAddress, ushort pointAddress, int value)
+{
+    if(configItem.RegistryType == PointType.ANALOG_OUTPUT)
+    {
+        value = eguConverter.ConvertToRaw(configItem.ScaleFactor, configItem.Deviation, value);
+        ExecuteAnalogCommand(configItem, transactionId, remoteUnitAddress, pointAddress, value);
+    }
+    else
+    {
+        ExecuteDigitalCommand(configItem, transactionId, remoteUnitAddress, pointAddress, value);
+    }
+}
+
+private void ExecuteAnalogCommand(IConfigItem configItem, ushort transactionId, byte remoteUnitAddress, ushort pointAddress, int value)
+{
+    double rawValue = eguConverter.ConvertToRaw(configItem.ScaleFactor, configItem.Deviation, value);
+    ModbusWriteCommandParameters p = new ModbusWriteCommandParameters(6, (byte)ModbusFunctionCode.WRITE_SINGLE_REGISTER, pointAddress, (ushort)rawValue, transactionId, remoteUnitAddress);
+    IModbusFunction fn = FunctionFactory.CreateModbusFunction(p);
+    this.functionExecutor.EnqueueCommand(fn);
+}
+
+private void ProcessDigitalPoint(IDigitalPoint point, ushort newValue)
+{
+    point.RawValue = newValue;
+    point.Timestamp = DateTime.Now;
+    point.State = (DState)newValue;
+    point.Alarm = alarmProcessor.GetAlarmForDigitalPoint(newValue, point.ConfigItem);
+}
+
+private void ProcessAnalogPoint(IAnalogPoint point, ushort newValue)
+{
+    point.RawValue = newValue;
+    point.Timestamp = DateTime.Now;
+    point.EguValue = eguConverter.ConvertToEGU(point.ConfigItem.ScaleFactor, point.ConfigItem.Deviation, point.RawValue);
+    point.Alarm = alarmProcessor.GetAlarmForAnalogPoint(newValue, point.ConfigItem);
+}
+
+//AutomationManager.cs
+
+private void AutomationWorker_DoWork()
+{
+    const int STEP = 10;
+
+    PointIdentifier kapija = new PointIdentifier(PointType.ANALOG_OUTPUT, 1000);
+    PointIdentifier openTaster = new PointIdentifier(PointType.DIGITAL_OUTPUT, 3000);
+    PointIdentifier closeTaster = new PointIdentifier(PointType.DIGITAL_OUTPUT, 3001);
+    PointIdentifier indikatorPrepreke = new PointIdentifier(PointType.DIGITAL_OUTPUT, 2000);
+
+    List<PointIdentifier> pointList = new List<PointIdentifier>{ kapija openTaster, closeTaster, indikatorPrepreke };
+    EGUConverter eguConverter = new EGUConverter();
+    double trenutniPolozajKapijeEGU = 0;
+
+    while(!disposeValue)
+    {
+        automationTrigger.WaitOne();
+
+        List<IPoint> points = storage.GetPoints(pointList);
+        int pomeraj = 0;
+
+        if(points[1].RawValue == 1)
+        {
+            pomeraj += STEP;
+        }
+        else if(points[2].RawValue == 1)
+        {
+            pomeraj -= STEP;
+        }
+
+        trenutniPolozajKapijeEGU = eguConverter.ConvertToEGU(
+            points[0].ConfigItem.ScaleFactor,
+            points[0].ConfigItem.Deviation,
+            points[0].RawValue
+        );
+
+        processingManager.ExecuteWriteCommand(
+            points[0].ConfigItem,
+            configuration.GetTransactionId(),
+            configuration.UnitAddress,
+            1000,
+            (int)(trenutniPolozajKapijeEGU + pomeraj)
+        );
+
+        trenutniPolozajKapijeEGU = eguConverter.ConvertToEGU(
+            points[0].ConfigItem.ScaleFactor,
+            points[0].COnfigItem.Deviation,
+            points[0].RawValue
+        );
+
+        if(trenutniPolozajKapijeEGU > points[0].ConfigItem.HighLimit)
+        {
+            processingManager.ExecuteWriteCommand(
+                points[2].ConfigItem,
+                configuration.GetTransactionId(),
+                configuration.UnitAddress,
+                3001,
+                0
+            );
+        }
+        else if(trenutniPolozajKapijeEGU < points[0].ConfigItem.LowLimit)
+        {
+            processingManager.ExecuteWriteCommand(
+                points[1].ConfigItem,
+                configuration.GetTransactionId(),
+                configuration.UnitAddress,
+                3000,
+                0
+            );
+        }
+
+        if(points[3].RawValue == 1)
+        {
+            processingManager.ExecuteWriteCommand(
+                points[0].ConfigItem,
+                configuration.GetTransactionId(),
+                configuration.UnitAddress,
+                1000,
+                (int)points[0].ConfigItem.LowLimit
+            );
+            {
+                processingManager.ExecuteWriteCommand(
+                    points[3].ConfigItem,
+                    configuration.GetTransactionId(),
+                    configuration.UnitAddress,
+                    2000,
+                    0
+                );
+            }
+        }
+    }
+}
+
+
